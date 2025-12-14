@@ -1,0 +1,452 @@
+import tkinter as tk
+from tkinter import filedialog, messagebox, Toplevel
+from PIL import Image, ImageTk
+import torch
+import torchvision.transforms as transforms
+import numpy as np
+import cv2
+import io
+import os
+
+# Import model and JND logic
+from model import JND_LIC_Lite_Autoencoder
+from jnd import calculate_jnd_map
+from skimage.metrics import structural_similarity as ssim
+
+class PICASO_GUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("PICASO v2.0 - Human-in-the-Loop Compression")
+        self.root.geometry("1200x800")
+        self.root.configure(bg="#f0f0f0")
+
+        # --- State Variables ---
+        self.image_path = None
+        self.original_image = None  # High-res original
+        self.compressed_image = None
+        self.tk_original = None
+        self.tk_compressed = None
+        
+        # Canvas State
+        self.selection_rect = None
+        self.start_x, self.start_y = None, None
+        self.end_x, self.end_y = None, None
+        
+        # Model
+        self.model = self.load_model()
+
+        # --- UI Layout ---
+        self._setup_ui()
+
+    def _setup_ui(self):
+        # Top Control Panel
+        control_frame = tk.Frame(self.root, bg="#e0e0e0", pady=10)
+        control_frame.pack(fill="x", side="top")
+
+        btn_style = {"bg": "#4a7a8c", "fg": "white", "font": ("Arial", 12, "bold"), "padx": 15, "pady": 5}
+        
+        self.btn_load = tk.Button(control_frame, text="1. Load Image", command=self.load_image, **btn_style)
+        self.btn_load.pack(side="left", padx=20)
+
+        self.lbl_instruction = tk.Label(control_frame, text="Draw a box around the important area ->", bg="#e0e0e0", font=("Arial", 11))
+        self.lbl_instruction.pack(side="left", padx=10)
+
+        self.btn_compress = tk.Button(control_frame, text="2. Compress (PICASO Engine)", command=self.run_picaso_compression, **btn_style)
+        self.btn_compress.pack(side="left", padx=20)
+
+        self.btn_analyze = tk.Button(control_frame, text="3. View Analysis Maps", command=self.show_analysis_window, state="disabled", bg="#555", fg="white", font=("Arial", 10))
+        self.btn_analyze.pack(side="right", padx=20)
+
+        # Main Display Area (Split View)
+        display_frame = tk.Frame(self.root, bg="#f0f0f0")
+        display_frame.pack(fill="both", expand=True, padx=10, pady=10)
+
+        # Left Canvas (Original + Selection)
+        self.canvas_frame = tk.Frame(display_frame, bg="white", bd=2, relief="sunken")
+        self.canvas_frame.pack(side="left", fill="both", expand=True, padx=5)
+        
+        self.lbl_orig = tk.Label(self.canvas_frame, text="Original Input (Draw ROI Here)", bg="white", font=("Arial", 10, "bold"))
+        self.lbl_orig.pack(side="top", pady=5)
+        
+        self.canvas = tk.Canvas(self.canvas_frame, cursor="cross", bg="#d9d9d9")
+        self.canvas.pack(fill="both", expand=True)
+        
+        # Right Canvas (Result)
+        self.result_frame = tk.Frame(display_frame, bg="white", bd=2, relief="sunken")
+        self.result_frame.pack(side="right", fill="both", expand=True, padx=5)
+
+        self.lbl_res = tk.Label(self.result_frame, text="Compressed Output", bg="white", font=("Arial", 10, "bold"))
+        self.lbl_res.pack(side="top", pady=5)
+
+        self.canvas_result = tk.Canvas(self.result_frame, bg="#d9d9d9")
+        self.canvas_result.pack(fill="both", expand=True)
+
+        # Status Bar
+        self.status_var = tk.StringVar()
+        self.status_var.set("Ready. Please load an image.")
+        status_bar = tk.Label(self.root, textvariable=self.status_var, bd=1, relief="sunken", anchor="w", bg="#e0e0e0")
+        status_bar.pack(side="bottom", fill="x")
+
+        # Bindings
+        self.canvas.bind("<ButtonPress-1>", self.on_button_press)
+        self.canvas.bind("<B1-Motion>", self.on_mouse_drag)
+        self.canvas.bind("<ButtonRelease-1>", self.on_button_release)
+
+    def load_model(self):
+        try:
+            model = JND_LIC_Lite_Autoencoder()
+            # Load the new v2.0 model trained on residuals
+            model_path = 'picaso_v2_model.pth'
+            if not os.path.exists(model_path):
+                # Fallback for demonstration if v2 model isn't ready yet
+                model_path = 'best_autoencoder.pth' 
+            
+            model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu')))
+            model = model.double()  # Ensure model is in float64
+            model.eval()
+            print(f"Loaded model: {model_path}")
+            return model
+        except Exception as e:
+            print(f"Model loading error: {e}")
+            return None
+
+    def load_image(self):
+        path = filedialog.askopenfilename(filetypes=[("Image Files", "*.jpg *.jpeg *.png")])
+        if not path: return
+        self.image_path = path
+        
+        # Load and resize for display/processing
+        # Note: For v2.0 Prototype, we stick to 128x128 processing to match model architecture
+        pil_img = Image.open(path).convert("RGB")
+        self.original_image = pil_img.resize((128, 128), Image.Resampling.LANCZOS) 
+        
+        # Display Original
+        self.tk_original = ImageTk.PhotoImage(self.original_image)
+        # Center image on canvas
+        cw, ch = 500, 500 # Approx canvas size
+        self.canvas.create_image(cw//2, ch//2, image=self.tk_original, anchor="center")
+        self.canvas.image = self.tk_original # Keep ref
+        
+        self.status_var.set("Image loaded. Please draw a selection box around the important area.")
+        
+        # Reset Selection
+        self.selection_rect = None
+        self.start_x, self.start_y, self.end_x, self.end_y = None, None, None, None
+
+    def on_button_press(self, event):
+        self.start_x, self.start_y = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
+        if self.selection_rect: self.canvas.delete(self.selection_rect)
+        self.selection_rect = self.canvas.create_rectangle(self.start_x, self.start_y, self.start_x, self.start_y, outline='#00ff00', width=2)
+
+    def on_mouse_drag(self, event):
+        cur_x, cur_y = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
+        self.canvas.coords(self.selection_rect, self.start_x, self.start_y, cur_x, cur_y)
+
+    def on_button_release(self, event):
+        self.end_x, self.end_y = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
+        self.status_var.set("Region selected. Click 'Compress' to proceed.")
+
+    def run_picaso_compression(self):
+        if not self.original_image or not self.model: return
+        if self.start_x is None:
+            messagebox.showerror("Error", "Please select a region first.")
+            return
+
+        self.status_var.set("Compressing... (Calculating JND, Residuals, and Encoding)")
+        self.root.update()
+
+        # 1. Coordinate Mapping (Canvas to Image)
+        # Since we center the image, we need offsets. For simplified prototype, 
+        # assuming image is centered or canvas matches image size. 
+        # To ensure robustness, let's assume coordinates are relative to canvas center
+        # For this MVP, we'll just clamp coordinates to the 128x128 image size
+        w, h = 128, 128
+        # Get canvas center
+        cw = int(self.canvas.winfo_width())
+        ch = int(self.canvas.winfo_height())
+        img_x = (cw - w) // 2
+        img_y = (ch - h) // 2
+        
+        # Adjust selection coords to image space
+        x1 = int(min(self.start_x, self.end_x)) - img_x
+        y1 = int(min(self.start_y, self.end_y)) - img_y
+        x2 = int(max(self.start_x, self.end_x)) - img_x
+        y2 = int(max(self.start_y, self.end_y)) - img_y
+        
+        # Clamp
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w, x2), min(h, y2)
+
+        # 2. Base Layer & Residual Calculation
+        import io
+        jpeg_buffer = io.BytesIO()
+        self.original_image.save(jpeg_buffer, format="JPEG", quality=20)
+        jpeg_buffer.seek(0)
+        base_layer_pil = Image.open(jpeg_buffer).convert("RGB")
+        
+        orig_np = np.array(self.original_image).astype(np.float32)
+        base_np = np.array(base_layer_pil).astype(np.float32)
+        residual_np = orig_np - base_np
+        
+        # Store for visualization
+        self.vis_base = base_layer_pil
+        self.vis_residual = Image.fromarray(((residual_np - residual_np.min()) / (residual_np.max() - residual_np.min()) * 255).astype(np.uint8))
+
+        # Normalize for model
+        residual_norm = (residual_np + 255.0) / 510.0
+        residual_input_pil = Image.fromarray(np.uint8(residual_norm * 255.0))
+        
+        # 3. JND Guidance
+        cv_img = cv2.cvtColor(np.array(self.original_image), cv2.COLOR_RGB2BGR)
+        jnd_map = calculate_jnd_map(cv_img)
+        self.vis_jnd = Image.fromarray((jnd_map * 255).astype(np.uint8))
+        
+        # Priority Mask & Guided Map
+        mask = np.zeros((h, w), dtype=np.float32)
+        if x2 > x1 and y2 > y1:
+            mask[y1:y2, x1:x2] = 1.0
+        self.vis_mask = Image.fromarray((mask * 255).astype(np.uint8))
+
+        # Guidance Logic
+        guided_map = np.full_like(jnd_map, 10.0) # High compression background
+        guided_map[mask == 1] = 0.1 # Low compression ROI
+        
+        # 4. Model Inference
+        img_tx = transforms.Compose([transforms.ToTensor()])
+        jnd_tx = transforms.Compose([transforms.ToTensor()]) # Already resized
+        
+        input_tensor = img_tx(residual_input_pil).unsqueeze(0)
+        jnd_tensor = jnd_tx(cv2.resize(jnd_map, (128,128)).astype(np.float32)).unsqueeze(0)
+        
+        input_tensor = input_tensor.double()
+        jnd_tensor = jnd_tensor.double()
+        
+        with torch.no_grad():
+            bottleneck, jnd_f1, jnd_f2 = self.model.encode(input_tensor, jnd_tensor)
+            
+            # Quantization
+            q_map_tensor = torch.from_numpy(cv2.resize(guided_map, (bottleneck.shape[3], bottleneck.shape[2]), interpolation=cv2.INTER_NEAREST)).unsqueeze(0).unsqueeze(0)
+            quantized = torch.round(bottleneck / q_map_tensor)
+            dequantized = quantized * q_map_tensor
+            dequantized = dequantized.double()
+            
+            recon_res_tensor = self.model.decode(dequantized, jnd_f1, jnd_f2)
+            
+        # 5. Reconstruction
+        recon_res_pil = transforms.ToPILImage()(recon_res_tensor.squeeze(0))
+        recon_res_np = np.array(recon_res_pil).astype(np.float32)
+        recon_res_final = (recon_res_np / 255.0) * 510.0 - 255.0
+        
+        final_np = np.clip(base_np + recon_res_final, 0, 255).astype(np.uint8)
+        self.compressed_image = Image.fromarray(final_np)
+        
+        # 6. Update UI
+        self.tk_compressed = ImageTk.PhotoImage(self.compressed_image)
+        self.canvas_result.create_image(self.canvas_result.winfo_width()//2, self.canvas_result.winfo_height()//2, image=self.tk_compressed, anchor="center")
+        
+        # Calculate Metric
+        s = ssim(np.array(self.original_image), np.array(self.compressed_image), channel_axis=2, data_range=255)
+        self.status_var.set(f"Compression Complete. SSIM: {s:.4f}")
+        self.btn_analyze.config(state="normal")
+
+    def show_analysis_window(self):
+        top = Toplevel(self.root)
+        top.title("PICASO Analysis Dashboard")
+        top.geometry("900x400")
+        
+        # Helper to place images
+        def place_img(parent, pil_img, title):
+            fr = tk.Frame(parent, bg="white", bd=1, relief="solid")
+            fr.pack(side="left", padx=10, pady=10, expand=True)
+            tk.Label(fr, text=title, font=("Arial", 9, "bold")).pack(side="top")
+            tk_img = ImageTk.PhotoImage(pil_img.resize((200, 200), Image.Resampling.NEAREST))
+            lbl = tk.Label(fr, image=tk_img)
+            lbl.image = tk_img
+            lbl.pack(side="bottom")
+
+        place_img(top, self.vis_mask, "1. User Priority Mask")
+        place_img(top, self.vis_jnd, "2. Base JND Map (Automated)")
+        place_img(top, self.vis_residual, "3. Residual Map (Detail)")
+        # Ideally, show the 'Guided JND Map' here too if space permits
+
+if __name__ == '__main__':
+    root = tk.Tk()
+    app = PICASO_GUI(root)
+    root.mainloop()
+'''
+import tkinter as tk
+from tkinter import filedialog
+from PIL import Image, ImageTk
+import torch
+import torchvision.transforms as transforms
+import numpy as np
+import cv2
+from model import JND_LIC_Lite_Autoencoder
+from jnd import calculate_jnd_map
+
+class PICASO_GUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("PICASO - User-Guided Image Compression")
+        
+        self.image_path = None
+        self.original_image = None
+        self.tk_image = None
+        self.selection_rect = None
+        self.start_x, self.start_y, self.end_x, self.end_y = None, None, None, None
+        self.model = self.load_model()
+
+        self.canvas = tk.Canvas(root, cursor="cross")
+        self.canvas.pack(fill="both", expand=True)
+        
+        button_frame = tk.Frame(root)
+        button_frame.pack(fill="x", side="bottom", pady=5)
+
+        self.btn_load = tk.Button(button_frame, text="Load Image", command=self.load_image)
+        self.btn_load.pack(side="left", padx=10)
+        self.btn_compress_guided = tk.Button(button_frame, text="Compress with Selection", command=self.run_guided_compression)
+        self.btn_compress_guided.pack(side="right", padx=10)
+
+        # --- FIX: Re-add the missing mouse event bindings ---
+        self.canvas.bind("<ButtonPress-1>", self.on_button_press)
+        self.canvas.bind("<B1-Motion>", self.on_mouse_drag)
+        self.canvas.bind("<ButtonRelease-1>", self.on_button_release)
+
+    def load_model(self):
+        try:
+            model = JND_LIC_Lite_Autoencoder()
+            model.load_state_dict(torch.load('picaso_v2_model.pth', map_location=torch.device('cpu')))
+            model.eval()
+            print("Successfully loaded trained model: best_autoencoder.pth")
+            return model
+        except FileNotFoundError:
+            print("Error: best_autoencoder.pth not found. Please train the model and place the file here.")
+            return None
+
+    def load_image(self):
+        self.image_path = filedialog.askopenfilename(filetypes=[("Image Files", "*.jpg *.jpeg *.png")])
+        if not self.image_path: return
+        self.original_image = Image.open(self.image_path).convert("RGB")
+        w, h = self.original_image.size
+        max_size = 600
+        if w > max_size or h > max_size: self.original_image.thumbnail((max_size, max_size))
+        self.tk_image = ImageTk.PhotoImage(self.original_image)
+        self.canvas.config(width=self.tk_image.width(), height=self.tk_image.height())
+        self.canvas.create_image(0, 0, anchor="nw", image=self.tk_image)
+
+    def on_button_press(self, event):
+        self.start_x, self.start_y = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
+        if self.selection_rect: self.canvas.delete(self.selection_rect)
+        self.selection_rect = self.canvas.create_rectangle(self.start_x, self.start_y, self.start_x, self.start_y, outline='red', width=2)
+
+    def on_mouse_drag(self, event):
+        cur_x, cur_y = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
+        self.canvas.coords(self.selection_rect, self.start_x, self.start_y, cur_x, cur_y)
+
+    def on_button_release(self, event):
+        self.end_x, self.end_y = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
+
+    # In app.py, replace the entire run_guided_compression method
+
+    # In app.py, replace the entire run_guided_compression method
+
+    def run_guided_compression(self):
+        if not self.original_image or self.model is None: return
+        if self.start_x is None or self.end_x is None:
+             print("Error: Please select a region first.")
+             return
+        print("--- Running PICASO v2.0 Residual Compression ---")
+
+        # --- NEW: Step 1 - Create the Low-Quality Base Layer ---
+        import io # Needed to handle in-memory JPEG saving
+        
+        # Save a low-quality JPEG version in memory
+        jpeg_buffer = io.BytesIO()
+        # Ensure we use a copy of the original image, resized for processing if needed
+        # NOTE: For a true v2.0, we'd process the full-res image in patches.
+        # For now, we'll still resize to ensure it fits the v1 model input size.
+        image_to_process = self.original_image.copy()
+        if image_to_process.size != (128, 128):
+             image_to_process = image_to_process.resize((128, 128))
+
+        image_to_process.save(jpeg_buffer, format="JPEG", quality=20) # quality=20 is low
+        jpeg_buffer.seek(0)
+        base_layer_pil = Image.open(jpeg_buffer).convert("RGB")
+        
+        # Convert images to NumPy arrays for calculation
+        original_np = np.array(image_to_process).astype(np.float32)
+        base_layer_np = np.array(base_layer_pil).astype(np.float32)
+
+        # --- NEW: Step 2 - Calculate the Residual Map ---
+        residual_np = original_np - base_layer_np
+        # Normalize residual to 0-1 range for the model (assuming values are roughly -255 to 255)
+        residual_normalized_np = (residual_np + 255.0) / 510.0
+        residual_pil = Image.fromarray(np.uint8(residual_normalized_np * 255.0)) # Convert for model input
+
+        # --- Step 3: Prepare Guidance (Same logic as before, but on original size) ---
+        open_cv_image_orig_size = cv2.cvtColor(np.array(self.original_image), cv2.COLOR_RGB2BGR) # Use original size for JND
+        jnd_map_np = calculate_jnd_map(open_cv_image_orig_size)
+
+        priority_mask_full = np.zeros((open_cv_image_orig_size.shape[0], open_cv_image_orig_size.shape[1]), dtype=np.uint8)
+        x1, y1 = int(min(self.start_x, self.end_x)), int(min(self.start_y, self.end_y))
+        x2, y2 = int(max(self.start_x, self.end_x)), int(max(self.start_y, self.end_y))
+        priority_mask_full[y1:y2, x1:x2] = 1
+        
+        # We need a guided map suitable for the *residual*, not the original image.
+        # For simplicity now, we'll use a basic two-level map.
+        # A more advanced v2.0 would create a JND map specific to the residual's properties.
+        guided_map_for_residual = np.full_like(jnd_map_np, 10.0, dtype=np.float32) # Aggressive background
+        guided_map_for_residual[priority_mask_full == 1] = 0.1 # High quality for ROI
+
+        # --- Step 4: Perform Guided Compression on the RESIDUAL ---
+        img_transform = transforms.Compose([transforms.ToTensor()]) # No resize needed if already 128x128
+        jnd_transform = transforms.Compose([transforms.ToTensor(), transforms.Resize((128, 128), antialias=True)]) # JND still needs resize for model
+
+        # The input to the model's image branch is now the residual
+        input_tensor = img_transform(residual_pil).unsqueeze(0)
+        # The input to the JND branch needs resizing to match model input
+        jnd_map_resized = cv2.resize(jnd_map_np, (128,128))
+        jnd_tensor = jnd_transform(jnd_map_resized.astype(np.float32)).unsqueeze(0)
+
+        with torch.no_grad():
+            bottleneck, jnd_f1, jnd_f2 = self.model.encode(input_tensor, jnd_tensor)
+            
+            latent_h, latent_w = bottleneck.shape[2], bottleneck.shape[3]
+            # Resize the guided_map_for_residual to latent size for quantization
+            guided_map_latent = cv2.resize(guided_map_for_residual, (latent_w, latent_h), interpolation=cv2.INTER_NEAREST)
+            quant_map_tensor = torch.from_numpy(guided_map_latent).float().unsqueeze(0).unsqueeze(0)
+            
+            quantized_data = torch.round(bottleneck / quant_map_tensor)
+            dequantized_data = quantized_data * quant_map_tensor
+            
+            # Decode the residual
+            reconstructed_residual_tensor = self.model.decode(dequantized_data, jnd_f1, jnd_f2)
+
+        # --- Step 5: Reconstruct the Final Image ---
+        reconstructed_residual_pil = transforms.ToPILImage()(reconstructed_residual_tensor.squeeze(0))
+        reconstructed_residual_np = np.array(reconstructed_residual_pil).astype(np.float32)
+        
+        # De-normalize the residual
+        reconstructed_residual_final_np = (reconstructed_residual_np / 255.0) * 510.0 - 255.0
+        
+        # Add the decompressed residual back to the base layer
+        final_image_np = base_layer_np + reconstructed_residual_final_np
+        final_image_np = np.clip(final_image_np, 0, 255) # Ensure pixel values are valid
+        
+        output_image = Image.fromarray(final_image_np.astype(np.uint8))
+
+        # --- Step 6: Save Output ---
+        save_path = filedialog.asksaveasfilename(defaultextension=".png", filetypes=[("PNG files", "*.png")])
+        if save_path:
+            output_image.save(save_path)
+            # You can also save the base layer and residual for analysis
+            # base_layer_pil.save("base_layer.jpg")
+            # residual_pil.save("residual_input.png")
+            # reconstructed_residual_pil.save("residual_output.png")
+            print(f"Compressed image saved to: {save_path}")
+
+if __name__ == '__main__':
+    root = tk.Tk()
+    app = PICASO_GUI(root)
+    root.mainloop()
+'''
