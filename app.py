@@ -175,16 +175,27 @@ class PICASO_GUI:
         jnd_map = calculate_jnd_map(orig_cv) 
         
         mask = np.zeros((full_h, full_w), dtype=np.float32)
-        mask[real_y1:real_y2, real_x1:real_x2] = 1.0
+        mask[real_y1:real_y2, real_x1:real_x2] = 1.0 #ROI injector
         #print("Mask: ", mask.min(), mask.max(), mask.mean())
         
-        guided_map = np.full_like(jnd_map, 15.0) # Higher quantization step for background
-        guided_map[mask == 1] = 0.1 # Low quantization step for ROI
+        #guided_map = np.full_like(jnd_map, 15.0) # Higher quantization step for background
+        #guided_map[mask == 1] = 0.1 # Low quantization step for ROI
         #print("Guided map: ", guided_map.min(), guided_map.max(), guided_map.mean())
+
+        # Smooth mask to give soft transitions at ROI boundaries (reduces visible seams)
+        k = 21 if min(full_w, full_h) >= 21 else 11
+        if k % 2 == 0:
+            k += 1
+        smoothed_mask = cv2.GaussianBlur(mask.astype(np.float32), (k, k), 0)
+        jnd_scaled = jnd_map * 15.0
+        guided_map = smoothed_mask * 0.1 + (1.0 - smoothed_mask) * jnd_scaled
+        guided_map = guided_map.astype(np.float32)
+
 
         # Save maps for analysis view
         self.vis_mask = Image.fromarray((mask * 255).astype(np.uint8))
         self.vis_jnd = Image.fromarray((jnd_map * 255).astype(np.uint8))
+        self.vis_guided = Image.fromarray((guided_map * 255).astype(np.uint8))
         self.vis_residual = Image.fromarray(((residual_np - residual_np.min())/(residual_np.max()-residual_np.min())*255).astype(np.uint8))
     
 
@@ -228,15 +239,17 @@ class PICASO_GUI:
                     
                     # Prepare JND
                     jnd_tensor = torch.from_numpy(jnd_patch).float().unsqueeze(0).unsqueeze(0)
+                    guided_tensor = torch.from_numpy(guided_patch).float().unsqueeze(0).unsqueeze(0)
                     
                     # Ensure input/jnd tensors are same device/dtype as model params if needed
                     model_param_dtype = next(self.model.parameters()).dtype
                     # Cast inputs to model dtype to avoid mismatches (safe even if already same)
                     input_tensor = input_tensor.to(dtype=model_param_dtype)
                     jnd_tensor = jnd_tensor.to(dtype=model_param_dtype)
+                    guided_tensor = guided_tensor.to(dtype=model_param_dtype)
                     
                     # Encode
-                    bottleneck, jnd_f1, jnd_f2 = self.model.encode(input_tensor, jnd_tensor)
+                    bottleneck, jnd_f1, jnd_f2 = self.model.encode(input_tensor, guided_tensor)
                     
                     # Quantize using the guided patch
                     # Resize guided patch to latent size (16x16)
@@ -286,12 +299,48 @@ class PICASO_GUI:
         
         # Save & Metric
         s = ssim(np.array(self.original_image), np.array(self.compressed_image), channel_axis=2, data_range=255)
-        self.status_var.set(f"Full Res Compression Complete! SSIM: {s:.4f}")
+        # Compute Compression Ratio (original file size on disk vs compressed JPEG bytes at quality=25)
+        try:
+            orig_size = os.path.getsize(self.image_path) if self.image_path else None
+            buf = io.BytesIO()
+            self.compressed_image.save(buf, format="JPEG", quality=25)
+            comp_size = buf.getbuffer().nbytes
+
+            def _hr(num):
+                if not num or num <= 0:
+                    return "N/A"
+                for unit in ['bytes', 'KB', 'MB', 'GB', 'TB']:
+                    if num < 1024.0 or unit == 'TB':
+                        if unit == 'bytes':
+                            return f"{num} {unit}"
+                        else:
+                            return f"{num / (1024.0 ** (['bytes','KB','MB','GB','TB'].index(unit))):.2f} {unit}"
+                return f"{num} bytes"
+
+            orig_hr = _hr(orig_size)
+            comp_hr = _hr(comp_size)
+
+            if orig_size and comp_size > 0:
+                cr = orig_size / comp_size
+                cr_str = f"{cr:.2f}x"
+            else:
+                cr_str = "N/A"
+        except Exception:
+            cr_str = "N/A"
+            orig_hr = "N/A"
+            comp_hr = "N/A"
+
+        self.status_var.set(f"Full Res Compression Complete! SSIM: {s:.4f} | CR: {cr_str} | Original Size: {orig_size} B -> Compressed Size: {comp_size} B")
         self.btn_analyze.config(state="normal")
         
-        save_path = filedialog.asksaveasfilename(defaultextension=".png", filetypes=[("PNG files", "*.png")])
+        save_path = filedialog.asksaveasfilename(defaultextension=".jpg", filetypes=[("JPEG files", "*.jpg;*.jpeg")])
         if save_path:
-            self.compressed_image.save(save_path)
+            #self.compressed_image.save(save_path)
+            # We save at a standard "good" quality (e.g., 75).
+            # PICASO's achievement is that at this quality level, 
+            # your ROI will look much better than if you just saved the raw image at quality 75.
+            self.compressed_image.save(save_path, format="JPEG", quality=25)
+            print(f"Saved compressed image to: {save_path}")
 
     def show_analysis_window(self):
         top = Toplevel(self.root)
@@ -310,7 +359,8 @@ class PICASO_GUI:
 
         place_img(top, self.vis_mask, "1. User Priority Mask")
         place_img(top, self.vis_jnd, "2. Base JND Map")
-        place_img(top, self.vis_residual, "3. Residual Map")
+        place_img(top, self.vis_guided, "3. Guided JND Map")
+        place_img(top, self.vis_residual, "4. Residual Map")
 
 if __name__ == '__main__':
     root = tk.Tk()

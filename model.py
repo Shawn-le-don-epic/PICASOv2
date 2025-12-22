@@ -90,6 +90,7 @@ class JND_LIC_Lite_Autoencoder(nn.Module):
     def forward(self, image, jnd_map):
         bottleneck, jnd_f1, jnd_f2 = self.encode(image, jnd_map)
         return self.decode(bottleneck, jnd_f1, jnd_f2), bottleneck
+        
 
 '''
 class JND_LIC_Lite_Autoencoder(nn.Module):
