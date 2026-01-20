@@ -467,7 +467,18 @@ class PICASO_GUI:
             orig_hr = "N/A"
             comp_hr = "N/A"
 
-        self.status_var.set(f"Full Res Compression Complete! SSIM: {s:.4f} | CR: {cr_str} | Original Size: {orig_size} B -> Compressed Size: {comp_size} B")
+        # Calculate PSNR
+        orig_array = np.array(self.original_image).astype(np.float64)
+        comp_array = np.array(self.compressed_image).astype(np.float64)
+        mse = np.mean((orig_array - comp_array) ** 2)
+        if mse == 0:
+            psnr = float('inf')
+            psnr_str = "∞ dB"
+        else:
+            psnr = 20 * np.log10(255.0 / np.sqrt(mse))
+            psnr_str = f"{psnr:.2f} dB"
+        
+        self.status_var.set(f"Full Res Compression Complete! SSIM: {s:.4f} | CR: {cr_str} | Original Size: {orig_size} B -> Compressed Size: {comp_size} B | PSNR: {psnr_str}")
         self.btn_analyze.config(state="normal")
         
         save_path = filedialog.asksaveasfilename(defaultextension=".jpg", filetypes=[("JPEG files", "*.jpg;*.jpeg")])
