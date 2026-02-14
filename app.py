@@ -56,8 +56,29 @@ class PICASO_GUI:
         self.btn_compress = tk.Button(control_frame, text="2. Compress (Full Res)", command=self.run_tiled_compression, **btn_style)
         self.btn_compress.pack(side="left", padx=20)
 
-        self.btn_analyze = tk.Button(control_frame, text="3. View Maps", command=self.show_analysis_window, state="disabled", bg="#555", fg="white", font=("Arial", 10))
+        self.btn_compress_full = tk.Button(
+            control_frame,
+            text="Compress Without ROI",
+            command=self.compress_without_roi,
+            **btn_style
+        )
+        self.btn_compress_full.pack(side="left", padx=30)
+
+
+        self.btn_analyze = tk.Button(control_frame, text="4. View Maps", command=self.show_analysis_window, state="disabled", bg="#555", fg="white", font=("Arial", 10))
         self.btn_analyze.pack(side="right", padx=20)
+
+        self.btn_metrics = tk.Button(
+            control_frame,
+            text="3. View Metrics",
+            command=self.show_metrics_window,
+            state="disabled",
+            bg="#555",
+            fg="white",
+            font=("Arial", 10)
+        )
+        self.btn_metrics.pack(side="right", padx=10)
+
 
         # Main Display Area
         display_frame = tk.Frame(self.root, bg="#f0f0f0")
@@ -156,6 +177,7 @@ class PICASO_GUI:
             model = JND_LIC_Lite_Autoencoder()
             
             # Try v3 model first (trained on residuals)
+            #dual stream model gives greenish tinge in output; residual gives proper output
             model_path = 'picaso_v3_residual_50e.pth'
             if not os.path.exists(model_path):
                 print("Warning: v3 model not found, falling back to v2 (trained on raw images, may not work properly with residuals)")
@@ -478,8 +500,18 @@ class PICASO_GUI:
             psnr = 20 * np.log10(255.0 / np.sqrt(mse))
             psnr_str = f"{psnr:.2f} dB"
         
+        #storing all metrics
+        # Store metrics for separate metrics window
+        self.metric_psnr = psnr_str
+        self.metric_ssim = f"{s:.4f}"
+        self.metric_cr = cr_str
+        self.metric_orig_size = orig_size
+        self.metric_comp_size = comp_size
+
+        
         self.status_var.set(f"Full Res Compression Complete! SSIM: {s:.4f} | CR: {cr_str} | Original Size: {orig_size} B -> Compressed Size: {comp_size} B | PSNR: {psnr_str}")
         self.btn_analyze.config(state="normal")
+        self.btn_metrics.config(state="normal")
         
         save_path = filedialog.asksaveasfilename(defaultextension=".jpg", filetypes=[("JPEG files", "*.jpg;*.jpeg")])
         if save_path:
@@ -489,6 +521,30 @@ class PICASO_GUI:
             # your ROI will look much better than if you just saved the raw image at quality 75.
             self.compressed_image.save(save_path, format="JPEG", quality=BASE_JPEG_QUALITY)
             print(f"Saved compressed image to: {save_path}")
+
+    def compress_without_roi(self):
+        if not self.original_image:
+            messagebox.showerror("Error", "Load an image first.")
+            return
+
+        # Default ROI = full displayed image
+        disp_w = int(self.original_image.size[0] * self.display_scale)
+        disp_h = int(self.original_image.size[1] * self.display_scale)
+
+        self.start_x = 0
+        self.start_y = 0
+        self.end_x = disp_w
+        self.end_y = disp_h
+
+        # Optional: draw visible ROI box for user clarity
+        if self.selection_rect:
+            self.canvas.delete(self.selection_rect)
+        self.selection_rect = self.canvas.create_rectangle(
+            0, 0, disp_w, disp_h, outline='#00ff00', width=2
+        )
+
+        self.run_tiled_compression()
+
 
     def show_analysis_window(self):
         top = Toplevel(self.root)
@@ -509,6 +565,25 @@ class PICASO_GUI:
         place_img(top, self.vis_jnd, "2. Base JND Map")
         place_img(top, self.vis_guided, "3. Guided JND Map")
         place_img(top, self.vis_residual, "4. Residual Map")
+
+    def show_metrics_window(self):
+        top = Toplevel(self.root)
+        top.title("PICASO v2.1 – Compression Metrics")
+        top.geometry("400x250")
+        top.configure(bg="white")
+
+        def add_row(label, value):
+            row = tk.Frame(top, bg="white")
+            row.pack(fill="x", pady=5, padx=10)
+            tk.Label(row, text=label, anchor="w", width=18, bg="white", font=("Arial", 10, "bold")).pack(side="left")
+            tk.Label(row, text=value, anchor="w", bg="white", font=("Arial", 10)).pack(side="left")
+
+        add_row("PSNR:", self.metric_psnr)
+        add_row("SSIM:", self.metric_ssim)
+        add_row("Compression Ratio:", self.metric_cr)
+        add_row("Original Size(in B):", self.metric_orig_size)
+        add_row("Compressed Size(in B):", self.metric_comp_size)
+
 
 if __name__ == '__main__':
     root = tk.Tk()
